@@ -78,6 +78,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER_MOE", default="True") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
@@ -145,10 +146,16 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     )
                     return CompressedTensorsMxInt4MoEMethod(quant_config)
                 elif _is_hip:
-                    logger.info_once(
-                        "Using CompressedTensorsWNA16TritonMoEMethod (ROCm)"
-                    )
-                    return CompressedTensorsWNA16TritonMoEMethod(quant_config)
+                    if _use_aiter_moe:
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16AiterMoEMethod (ROCm AITER CK)"
+                        )
+                        return CompressedTensorsWNA16AiterMoEMethod(quant_config)
+                    else:
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16TritonMoEMethod (ROCm Triton)"
+                        )
+                        return CompressedTensorsWNA16TritonMoEMethod(quant_config)
                 else:
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoEMethod(quant_config)
@@ -1447,6 +1454,87 @@ class CompressedTensorsWNA16TritonMoEMethod(CompressedTensorsWNA16MoEMethod):
         )
         return self.runner.run(dispatch_output, quant_info)
 
+
+
+
+class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
+    """ROCm/HIP W4A16 MoE method using AITER CK kernels.
+    
+    Inherits weight creation from CompressedTensorsWNA16MoEMethod but converts
+    weights to the format expected by AITER fused_moe kernel.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_aiter_converted", False):
+            return
+
+        num_experts = layer.w13_weight_packed.shape[0]
+        
+        # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8 -> shuffle
+        w13 = layer.w13_weight_packed.data
+        # Transpose and convert to uint8
+        w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        # Apply AITER shuffle for MI300X
+        w13 = shuffle_weight(w13, layout=(16, 16), use_int4=True)
+        layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+        # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8 -> shuffle
+        w2 = layer.w2_weight_packed.data
+        w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        w2 = shuffle_weight(w2, layout=(16, 16), use_int4=True)
+        layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+        # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w13_scale = layer.w13_weight_scale.data
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+
+        # Convert w2 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w2_scale = layer.w2_weight_scale.data
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+
+        layer.is_aiter_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        self.moe_runner_config = moe_runner_config
+        # No runner needed - we call AITER directly
+        self.runner = None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        
+        topk_output = dispatch_output.topk_output
+        
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported for AITER MoE."
+
+        # Determine quant_type based on group_size
+        if self.group_size == -1:
+            quant_type = QuantType.per_Tensor  # per-channel
+        else:
+            quant_type = QuantType.per_1x128  # per-group
+
+        output = fused_moe(
+            dispatch_output.hidden_states,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            activation=ActivationType.Silu,
+            quant_type=quant_type,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        )
+
+        return StandardCombineInput(hidden_states=output)
 
 class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
