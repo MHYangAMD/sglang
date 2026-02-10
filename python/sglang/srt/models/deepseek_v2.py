@@ -2629,7 +2629,14 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
-        device = input_embeds.device if input_embeds is not None else input_ids.device
+        if input_embeds is not None:
+            device = input_embeds.device
+        elif input_ids is not None:
+            device = input_ids.device
+        else:
+            # For non-first PP rank, get device from pp_proxy_tensors
+            assert pp_proxy_tensors is not None, "pp_proxy_tensors required for non-first PP rank"
+            device = pp_proxy_tensors["hidden_states"].device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
