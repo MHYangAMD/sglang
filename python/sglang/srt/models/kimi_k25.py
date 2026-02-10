@@ -1,6 +1,6 @@
 import logging
 from copy import deepcopy
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -9,11 +9,13 @@ from torch import nn
 from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 try:
     from transformers.activations import PytorchGELUTanh
@@ -659,6 +661,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
+        # Initialize PP group for pipeline parallelism support
+        self.pp_group = get_pp_group()
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if hasattr(self.language_model, "dtype"):
@@ -695,7 +700,20 @@ class KimiK25ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
-    ):
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        """Forward pass with Pipeline Parallelism support.
+
+        Args:
+            input_ids: Input token IDs
+            positions: Position IDs
+            forward_batch: Forward batch information
+            get_embedding: Whether to return embeddings
+            pp_proxy_tensors: Pipeline parallelism proxy tensors for inter-stage communication
+
+        Returns:
+            Hidden states or logits depending on PP rank
+        """
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -704,6 +722,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states
@@ -745,3 +764,4 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
 
 EntryClass = [KimiK25ForConditionalGeneration]
+
